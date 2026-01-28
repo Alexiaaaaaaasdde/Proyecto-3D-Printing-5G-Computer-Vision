@@ -87,6 +87,20 @@ class ConfigSistema:
     # Control
     TOLERANCIA_ERROR = 0.5       # mm de tolerancia
 
+    # ===========================
+    # ANTI-"DISTRACCIÓN" (ROI + TRACKING)
+    # ===========================
+    USE_ROI = True
+
+    # ROI en porcentajes sobre 640x480 (ajusta si tu filamento está en otra zona)
+    ROI_X1 = 0.25
+    ROI_X2 = 0.75
+    ROI_Y1 = 0.20
+    ROI_Y2 = 0.80
+
+    HOLD_LAST_N_MISSES = 2   # cuántos frames aguanta sin contorno (anti-jitter)
+
+
 # ===========================
 # CLASE SENSOR TOF
 # ===========================
@@ -146,6 +160,12 @@ class MedidorAncho:
         # Kernel morfológico optimizado
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
+        # Tracking simple para evitar que se "distraiga"
+        self.last_center = None
+        self.last_ancho = None
+        self.miss_count = 0
+
+
     def procesar_frame(self, depth_frame, color_frame=None):
         """
         Procesa un frame y calcula el ancho del filamento
@@ -160,7 +180,7 @@ class MedidorAncho:
         elif depth_frame is not None:
             return self._procesar_depth(depth_frame)
         return None, None
-    
+
     def _procesar_color(self, color_frame):
         """Procesa frame de color para detectar filamento.
 
@@ -175,7 +195,7 @@ class MedidorAncho:
             gray = frame_to_gray_image(color_frame)
             if gray is None:
                 return None, None
-            
+
             # Telecom: bajar resolución reduce el costo O(N) de filtros/contornos.
             # 1920x1080 → 640x480 ≈ 6.75x menos píxeles (y suele sentirse “>5x”).
             PROC_W, PROC_H = 640, 480
@@ -183,61 +203,105 @@ class MedidorAncho:
             if w_orig > PROC_W or h_orig > PROC_H:
                 gray = cv2.resize(gray, (PROC_W, PROC_H))
 
-            # Telecom: OTSU = umbral adaptativo global (rápido) adecuado si iluminación estable.
-            ret, binary = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # --- ROI (para que no se distraiga con cosas fuera del filamento) ---
+            PROC_W, PROC_H = 640, 480
+            h_orig, w_orig = gray.shape[:2]
+            if w_orig > PROC_W or h_orig > PROC_H:
+                gray = cv2.resize(gray, (PROC_W, PROC_H))
+
+            x_off, y_off = 0, 0
+            work = gray
+            if ConfigSistema.USE_ROI:
+                x1 = int(PROC_W * ConfigSistema.ROI_X1)
+                x2 = int(PROC_W * ConfigSistema.ROI_X2)
+                y1 = int(PROC_H * ConfigSistema.ROI_Y1)
+                y2 = int(PROC_H * ConfigSistema.ROI_Y2)
+                work = gray[y1:y2, x1:x2]
+                x_off, y_off = x1, y1
+
+            # Umbral (usa tu self.umbral y OTSU)
+            ret, binary = cv2.threshold(work, self.umbral, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
             # Telecom: morfología para limpiar ruido impulsivo y cerrar huecos (mejora contorno).
             binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, self.kernel)
             binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, self.kernel)
-            
+
             # Telecom: contornos = extracción de “blobs” (ROI implícita).
             result = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             contours = result[0] if len(result) == 2 else result[1]
-            
+
             # Imagen de salida para UI (BGR porque OpenCV imshow espera BGR/Gray)
             vis_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-            
+
+            if ConfigSistema.USE_ROI:
+                cv2.rectangle(vis_image, (x_off, y_off),
+                      (x_off + work.shape[1], y_off + work.shape[0]),
+                      (255, 0, 0), 2)
+
+
             ancho_mm = None
-            
+
             if len(contours) > 0:
                 # Filtrar contornos por área
-                contornos_validos = [c for c in contours 
+                contornos_validos = [c for c in contours
                                     if cv2.contourArea(c) > ConfigSistema.MIN_AREA_CONTORNO]
-                
+
                 if contornos_validos:
-                    # Tomar el contorno más grande
-                    contorno_principal = max(contornos_validos, key=cv2.contourArea)
-                    
-                    # Dibujar contorno
-                    cv2.drawContours(vis_image, [contorno_principal], -1, (0, 255, 0), 2)
-                    
+                    # Tomar contorno principal:
+                    # - Si no hay historial: el más grande (como antes)
+                    # - Si hay historial: el más cercano al centro anterior (evita "distracciones")
+                    if self.last_center is None:
+                        contorno_principal = max(contornos_validos, key=cv2.contourArea)
+                    else:
+                        lx, ly = self.last_center
+                        def dist2(c):
+                            x, y, w, h = cv2.boundingRect(c)
+                            cx = x_off + x + w / 2.0
+                            cy = y_off + y + h / 2.0
+                            dx = cx - lx
+                            dy = cy - ly
+                            return dx*dx + dy*dy
+                        contorno_principal = min(contornos_validos, key=dist2)
+
+                    # Desplazar contorno del ROI a coordenadas globales para dibujar
+                    cont_shift = contorno_principal.copy()
+                    cont_shift[:, 0, 0] += x_off
+                    cont_shift[:, 0, 1] += y_off
+                    cv2.drawContours(vis_image, [cont_shift], -1, (0, 255, 0), 2)
+
                     # Telecom: minAreaRect da orientación + dimensiones. El “ancho”
                     # se asume como el lado menor del rectángulo (filamento ~cilindro).
-                    rect = cv2.minAreaRect(contorno_principal)
+                    rect = cv2.minAreaRect(cont_shift)  # usar el contorno ya desplazado
                     box = cv2.boxPoints(rect)
                     box = np.int0(box)
-                    
+
                     # Dibujar rectángulo
                     cv2.drawContours(vis_image, [box], 0, (0, 0, 255), 2)
-                    
+
                     # Calcular ancho (el lado más corto)
                     width_rect, height_rect = rect[1]
                     ancho_pixels = min(width_rect, height_rect)
-                    
+
                     # Telecom: conversión pixel→mm (calibración). Ajustar PIXELS_TO_MM.
                     ancho_mm = ancho_pixels * ConfigSistema.PIXELS_TO_MM
-                    
+
+                    # Guardar historial para tracking y hold
+                    self.last_center = rect[0]
+                    self.last_ancho = ancho_mm
+                    self.miss_count = 0
+
+
                     # Añadir al buffer
                     self.buffer_anchos.append(ancho_mm)
-                    
+
                     # Telecom: filtro temporal (promedio móvil) para suavizar jitter.
                     if len(self.buffer_anchos) > 0:
                         ancho_mm = np.mean(self.buffer_anchos)
-                    
+
                     # Dibujar centro
                     center = tuple(np.int0(rect[0]))
                     cv2.circle(vis_image, center, 5, (255, 0, 255), -1)
-                    
+
                     # Dibujar línea de medición (azul)
                     width_rect, height_rect = rect[1]
                     if width_rect < height_rect:
@@ -251,18 +315,18 @@ class MedidorAncho:
                         pt1 = (center[0], center[1] - y_offset)
                         pt2 = (center[0], center[1] + y_offset)
                     cv2.line(vis_image, pt1, pt2, (255, 255, 0), 3)
-                    
+
                     # Texto con medición (MÁS GRANDE y en posición fija)
-                    cv2.putText(vis_image, f"ANCHO: {ancho_mm:.2f}mm", 
+                    cv2.putText(vis_image, f"ANCHO: {ancho_mm:.2f}mm",
                                (10, 60),
                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
-            
+
             return ancho_mm, vis_image
-            
+        
         except Exception as e:
             print(f"Error procesando color: {e}")
             return None, None
-    
+
     def _procesar_depth(self, depth_frame):
         """Procesa frame de depth (método original)"""
         try:
@@ -345,6 +409,10 @@ class MedidorAncho:
                     cv2.putText(vis_image, f"ANCHO: {ancho_mm:.2f}mm", 
                                (10, 60),
                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+                else:
+                    self.miss_count += 1
+                    if self.last_ancho is not None and self.miss_count <= ConfigSistema.HOLD_LAST_N_MISSES:
+                        return self.last_ancho, vis_image
 
             return ancho_mm, vis_image
             
