@@ -493,7 +493,7 @@ def configurar_pipeline_rapido(device, use_color=True):
             perfil_seleccionado = None
             perfil_fallback = None
 
-            print("\n  📹 Perfiles de color disponibles:")
+            print("\n  Perfiles de color disponibles:")
             for i in range(color_profiles.get_count()):
                 profile = color_profiles.get_profile(i)
                 vp = profile.as_video_stream_profile()
@@ -538,7 +538,7 @@ def configurar_pipeline_rapido(device, use_color=True):
                 config.enable_stream(perfil_fallback)
                 print(f"\n  ⚠ Usando perfil fallback (puede afectar velocidad)")
             else:
-                print("\n  ❌ No se encontraron perfiles COLOR")
+                print("\n  No se encontraron perfiles COLOR")
                 return None, None
 
         else:
@@ -548,7 +548,7 @@ def configurar_pipeline_rapido(device, use_color=True):
             depth_profiles = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
 
             perfil_depth = None
-            print("\n  📊 Perfiles de profundidad disponibles:")
+            print("\n  Perfiles de profundidad disponibles:")
 
             for i in range(depth_profiles.get_count()):
                 profile = depth_profiles.get_profile(i)
@@ -571,7 +571,7 @@ def configurar_pipeline_rapido(device, use_color=True):
                 config.enable_stream(perfil_depth)
                 print(f"\n  ✓ Pipeline DEPTH configurado")
             else:
-                print(f"\n  ❌ No se encontró perfil DEPTH adecuado")
+                print(f"\n  No se encontró perfil DEPTH adecuado")
                 return None, None
 
         # Iniciar pipeline
@@ -588,7 +588,7 @@ def configurar_pipeline_rapido(device, use_color=True):
         return pipeline, config
 
     except Exception as e:
-        print(f"\n  ❌ Error configurando pipeline: {e}")
+        print(f"\n Error configurando pipeline: {e}")
         return None, None
 
 # ===========================
@@ -601,7 +601,7 @@ def main():
     print("="*70)
     print(" SISTEMA DE MONITOREO MEJORADO - ALTA VELOCIDAD + ESTADOS")
     print("="*70)
-    print("\n💡 MEJORAS:")
+    print("\nMEJORAS:")
     print("  ✓ Cámaras optimizadas: 1 FPS → 30 FPS")
     print("  ✓ Sistema de estados inteligente")
     print("  ✓ Gestión de energía del sensor ToF")
@@ -618,17 +618,17 @@ def main():
 
     # Contexto de cámaras
     if not ORBBEC_DISPONIBLE:
-        print("❌ SDK Orbbec no disponible")
+        print("SDK Orbbec no disponible")
         return
 
     ctx = Context()
     device_list = ctx.query_devices()
     num_devices = device_list.get_count()
 
-    print(f"\n🎥 Detectadas {num_devices} cámara(s) Orbbec")
+    print(f"\nDetectadas {num_devices} cámara(s) Orbbec")
 
     if num_devices == 0:
-        print("❌ No se detectaron cámaras")
+        print("No se detectaron cámaras")
         return
 
     # Configurar cámaras
@@ -637,7 +637,7 @@ def main():
                                                     use_color=ConfigSistema.USE_COLOR)
 
     if pipeline0 is None:
-        print("❌ Error configurando cámara 0")
+        print("Error configurando cámara 0")
         return
 
     # Segunda cámara (opcional)
@@ -719,7 +719,7 @@ def main():
                 time.sleep(0.01)
 
     # Iniciar threads
-    print("\n🚀 Iniciando workers de captura...")
+    print("\nIniciando workers de captura...")
     th0 = threading.Thread(target=worker_cam0, daemon=True)
     th0.start()
 
@@ -732,7 +732,7 @@ def main():
     # FASE DE CALIBRACIÓN
     # ===========================
     print("\n" + "="*70)
-    print("📊 FASE: CALIBRACIÓN")
+    print("FASE: CALIBRACIÓN")
     print("="*70)
     print("Recolectando datos baseline (5 segundos)...")
 
@@ -760,7 +760,7 @@ def main():
     controlador_estados.cambiar_estado(EstadoSistema.MONITOREO_ACTIVO)
 
     print("\n" + "="*70)
-    print("🎯 FASE: MONITOREO ACTIVO")
+    print("FASE: MONITOREO ACTIVO")
     print("="*70)
     print("\nControles:")
     print("  [Q] - Salir")
@@ -894,24 +894,24 @@ def main():
 
                 # Info de estado
                 info_estado = controlador_estados.obtener_info()
-                print(f"  🔄 Estado: {info_estado['estado_sistema']} "
+                print(f"Estado: {info_estado['estado_sistema']} "
                       f"(Sensor: {info_estado['estado_sensor']})")
 
                 if distancia_tof:
-                    print(f"  📊 ToF: {distancia_tof:.1f} cm")
+                    print(f"ToF: {distancia_tof:.1f} cm")
 
                 if ancho0:
                     error0 = ancho0 - ancho_objetivo
-                    print(f"  📸 Cam0: {ancho0:.2f} mm (error: {error0:+.2f} mm)")
+                    print(f"Cam0: {ancho0:.2f} mm (error: {error0:+.2f} mm)")
 
                 if ancho1:
                     error1 = ancho1 - ancho_objetivo
-                    print(f"  📸 Cam1: {ancho1:.2f} mm (error: {error1:+.2f} mm)")
+                    print(f"Cam1: {ancho1:.2f} mm (error: {error1:+.2f} mm)")
 
                 if ancho0 and ancho1:
                     ancho_prom = (ancho0 + ancho1) / 2
                     error_prom = ancho_prom - ancho_objetivo
-                    print(f"  📏 Promedio: {ancho_prom:.2f} mm "
+                    print(f"Promedio: {ancho_prom:.2f} mm "
                           f"(error: {error_prom:+.2f} mm)")
 
                     if abs(error_prom) <= ConfigSistema.TOLERANCIA_ERROR:
