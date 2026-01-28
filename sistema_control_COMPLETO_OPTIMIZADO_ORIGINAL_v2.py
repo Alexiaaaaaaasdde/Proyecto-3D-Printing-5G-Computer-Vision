@@ -198,10 +198,6 @@ class MedidorAncho:
 
             # Telecom: bajar resolución reduce el costo O(N) de filtros/contornos.
             # 1920x1080 → 640x480 ≈ 6.75x menos píxeles (y suele sentirse “>5x”).
-            PROC_W, PROC_H = 640, 480
-            h_orig, w_orig = gray.shape[:2]
-            if w_orig > PROC_W or h_orig > PROC_H:
-                gray = cv2.resize(gray, (PROC_W, PROC_H))
 
             # --- ROI (para que no se distraiga con cosas fuera del filamento) ---
             PROC_W, PROC_H = 640, 480
@@ -320,9 +316,18 @@ class MedidorAncho:
                     cv2.putText(vis_image, f"ANCHO: {ancho_mm:.2f}mm",
                                (10, 60),
                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+                else:
+                    self.miss_count += 1
+                    if self.last_ancho is not None and self.miss_count <= ConfigSistema.HOLD_LAST_N_MISSES:
+                        return self.last_ancho, vis_image
+
+            else:
+                self.miss_count += 1
+                if self.last_ancho is not None and self.miss_count <= ConfigSistema.HOLD_LAST_N_MISSES:
+                    return self.last_ancho, vis_image
 
             return ancho_mm, vis_image
-        
+
         except Exception as e:
             print(f"Error procesando color: {e}")
             return None, None
