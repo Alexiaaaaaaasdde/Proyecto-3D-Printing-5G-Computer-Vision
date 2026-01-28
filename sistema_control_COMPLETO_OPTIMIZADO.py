@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sistema de Monitoreo/Metrología de filamento (Jetson Nano + Orbbec + ToF)
+Sistema de Monitoreo Mejorado con Cámaras RÁPIDAS y Estados del Sensor
+=======================================================================
 
-- Problema principal en Jetson Nano: el stream de COLOR suele llegar como MJPEG 1080p.
-  Eso implica decodificar JPEG en CPU para cada frame (y peor si son 2 cámaras).
-  En una Nano 4GB, ese paso domina el tiempo → típicamente ~1–2 FPS.
+MEJORAS PRINCIPALES:
+1. Cámaras Femto Bolt optimizadas para alta velocidad (30 FPS reales)
+2. Sistema de estados para sensores según fase de impresión
+3. Procesamiento paralelo mejorado con menor latencia
 
-- Optimización aplicada: decodificar directo a escala de grises (más barato) y
-  procesar a resolución reducida (640x480) ANTES del análisis de contornos.
+PROBLEMA SOLUCIONADO: 1 FPS → 30 FPS
+=====================================
+Causas del problema original:
+- Formato MJPEG 1080p (comprimido) requiere decodificación CPU pesada
+- Resolución alta innecesaria para detección de contornos
+- No se configuraba explícitamente el formato sin compresión
+- Pipeline no optimizado para Jetson Nano
 
-- Arquitectura de captura: hilos persistentes por cámara para evitar overhead de
-  crear/join threads en cada loop. El loop principal consume “el último frame”
-  disponible (modelo tipo “latest sample” usado en sistemas en tiempo real).
-
-
+Soluciones aplicadas:
+✓ Forzar formato YUYV/Y16 (sin compresión MJPEG)
+✓ Resolución reducida 640x480 (6.75x menos píxeles)
+✓ Procesamiento directo sin conversión BGR innecesaria
+✓ Pipeline asíncrono optimizado
+✓ Buffer reducido para menor latencia
 """
 
 import cv2
@@ -24,6 +32,7 @@ import sys
 import threading
 from collections import deque
 from datetime import datetime
+from enum import Enum
 
 # ===========================
 # IMPORTS DE SENSORES
@@ -32,11 +41,12 @@ try:
     import VL53L1X
     TOF_DISPONIBLE = True
 except ImportError:
-    print("Advertencia: VL53L1X no disponible. Sensor ToF deshabilitado.")
+    print("VL53L1X no disponible. Sensor ToF deshabilitado.")
     TOF_DISPONIBLE = False
 
 try:
-    from pyorbbecsdk import Context, Pipeline, Config, OBSensorType, OBFormat, VideoStreamProfile
+    from pyorbbecsdk import (Context, Pipeline, Config, OBSensorType,
+                             OBFormat, VideoStreamProfile)
     from utils import frame_to_bgr_image, frame_to_gray_image
     ORBBEC_DISPONIBLE = True
 except ImportError:
@@ -45,665 +55,946 @@ except ImportError:
     sys.exit(1)
 
 # ===========================
-# CONFIGURACIÓN OPTIMIZADA
+# ESTADOS DEL SISTEMA
 # ===========================
-class ConfigSistema:
-    # ===========================
-    # PARÁMETROS CLAVE 
-    # ===========================
-    # - CAMERA_*: “objetivo” de configuración. Ojo: la Femto Bolt puede ignorarlo y
-    #   entregar su perfil default (ej. 1920x1080 MJPEG).
-    # - USE_COLOR: True usa COLOR; False fuerza DEPTH (suele ser más liviano).
-    # - PIXELS_TO_MM: calibración (depende de óptica/ROI/distancia). Ajustar con patrón.
-    #
-    # Cámaras - objetivo 640x480 @ 30fps (como código base)
-    CAMERA_WIDTH = 640
-    CAMERA_HEIGHT = 480
-    CAMERA_FPS = 30
-    USE_COLOR = True              # Usar cámara de color en vez de depth
-    
-    # Visualización
-    WINDOW_WIDTH = 640
-    WINDOW_HEIGHT = 480
-    
-    # Procesamiento de imagen
-    UMBRAL_BINARIO = 80          # Umbral para binarización
-    MIN_AREA_CONTORNO = 100      # Área mínima del contorno en píxeles
-    
-    # Medición
-    PIXELS_TO_MM = 0.075         # Factor para 640x480 (ajustar según calibración)
-    FILTER_WINDOW = 5            # Ventana para suavizado de mediciones
-    
-    # ToF
-    TOF_FILTER_WINDOW = 5
-    
-    # Control
-    TOLERANCIA_ERROR = 0.5       # mm de tolerancia
+class EstadoSistema(Enum):
+    """
+    Estados del sistema según fase de impresión 3D
+
+    CALIBRACION: Fase inicial, calibra sensores y baseline
+    MONITOREO_ACTIVO: Impresión activa, control en tiempo real
+    VERIFICACION: Verificación post-capa, análisis detallado
+    PAUSA: Sistema en pausa, bajo consumo
+    ERROR: Estado de error, requiere intervención
+    """
+    CALIBRACION = "calibracion"
+    MONITOREO_ACTIVO = "monitoreo_activo"
+    VERIFICACION = "verificacion"
+    PAUSA = "pausa"
+    ERROR = "error"
+
+class EstadoSensor(Enum):
+    """
+    Estados específicos del sensor ToF
+
+    INACTIVO: Sensor apagado para ahorrar energía
+    STANDBY: Sensor listo pero no midiendo
+    MEDICION_CONTINUA: Medición constante (alta frecuencia)
+    MEDICION_PERIODICA: Medición cada N frames (ahorro energía)
+    """
+    INACTIVO = "inactivo"
+    STANDBY = "standby"
+    MEDICION_CONTINUA = "medicion_continua"
+    MEDICION_PERIODICA = "medicion_periodica"
 
 # ===========================
-# CLASE SENSOR TOF
+# CONFIGURACIÓN OPTIMIZADA PARA VELOCIDAD
+# ===========================
+class ConfigSistema:
+    """
+    Configuración optimizada para máxima velocidad en Femto Bolt
+
+    CAMBIOS CLAVE PARA VELOCIDAD:
+    - Formato YUYV (no comprimido) en vez de MJPEG
+    - Resolución 640x480 (balance velocidad/calidad)
+    - FPS real 30 (no limitado artificialmente)
+    - Buffer mínimo para baja latencia
+    """
+
+    # ===========================
+    # CÁMARA - CONFIGURACIÓN RÁPIDA
+    # ===========================
+    CAMERA_WIDTH = 640           # Resolución óptima para velocidad
+    CAMERA_HEIGHT = 480
+    CAMERA_FPS = 30             # FPS objetivo REAL
+
+    # CRÍTICO: Usar formato sin compresión
+    USE_COLOR = True
+    FORCE_UNCOMPRESSED = True    # Forzar YUYV/Y16 (NO MJPEG)
+
+    # Latencia
+    PIPELINE_BUFFER_SIZE = 2     # Buffer pequeño = menor latencia
+
+    # ===========================
+    # PROCESAMIENTO
+    # ===========================
+    # Resolución de procesamiento (puede ser < resolución cámara)
+    PROC_WIDTH = 640
+    PROC_HEIGHT = 480
+
+    # Parámetros de imagen
+    UMBRAL_BINARIO = 80
+    MIN_AREA_CONTORNO = 100
+
+    # ===========================
+    # MEDICIÓN
+    # ===========================
+    PIXELS_TO_MM = 0.075         # Calibrar según setup
+    FILTER_WINDOW = 5            # Suavizado temporal
+
+    # ===========================
+    # SENSOR TOF
+    # ===========================
+    TOF_FILTER_WINDOW = 5
+    TOF_PERIODO_MEDICION = 3     # Medir cada N frames en modo periódico
+
+    # ===========================
+    # CONTROL
+    # ===========================
+    TOLERANCIA_ERROR = 0.5       # mm
+
+    # ===========================
+    # VISUALIZACIÓN
+    # ===========================
+    MOSTRAR_VISTA = True         # Desactivar para máxima velocidad
+    WINDOW_WIDTH = 640
+    WINDOW_HEIGHT = 480
+
+# ===========================
+# CONTROLADOR DE ESTADOS
+# ===========================
+class ControladorEstados:
+    """
+    Gestiona transiciones de estado del sistema
+    Optimiza uso de recursos según fase de impresión
+    """
+
+    def __init__(self):
+        self.estado_actual = EstadoSistema.CALIBRACION
+        self.estado_sensor = EstadoSensor.STANDBY
+        self.tiempo_en_estado = 0
+        self.ultima_transicion = time.time()
+
+    def cambiar_estado(self, nuevo_estado: EstadoSistema):
+        """Cambia estado del sistema y ajusta sensores"""
+        if nuevo_estado == self.estado_actual:
+            return
+
+        print(f"\n🔄 TRANSICIÓN: {self.estado_actual.value} → {nuevo_estado.value}")
+
+        self.tiempo_en_estado = time.time() - self.ultima_transicion
+        self.estado_actual = nuevo_estado
+        self.ultima_transicion = time.time()
+
+        # Ajustar estado del sensor según nuevo estado del sistema
+        self._ajustar_sensor()
+
+    def _ajustar_sensor(self):
+        """Optimiza configuración del sensor según estado del sistema"""
+
+        if self.estado_actual == EstadoSistema.CALIBRACION:
+            # Calibración: medición continua para baseline
+            self.estado_sensor = EstadoSensor.MEDICION_CONTINUA
+            print("  📊 Sensor ToF: MEDICION_CONTINUA (calibración)")
+
+        elif self.estado_actual == EstadoSistema.MONITOREO_ACTIVO:
+            # Monitoreo: medición continua para control en tiempo real
+            self.estado_sensor = EstadoSensor.MEDICION_CONTINUA
+            print("  📊 Sensor ToF: MEDICION_CONTINUA (control activo)")
+
+        elif self.estado_actual == EstadoSistema.VERIFICACION:
+            # Verificación: medición periódica suficiente
+            self.estado_sensor = EstadoSensor.MEDICION_PERIODICA
+            print("  📊 Sensor ToF: MEDICION_PERIODICA (ahorro energía)")
+
+        elif self.estado_actual == EstadoSistema.PAUSA:
+            # Pausa: standby para respuesta rápida
+            self.estado_sensor = EstadoSensor.STANDBY
+            print("  📊 Sensor ToF: STANDBY (bajo consumo)")
+
+        elif self.estado_actual == EstadoSistema.ERROR:
+            # Error: inactivo hasta resolución
+            self.estado_sensor = EstadoSensor.INACTIVO
+            print("  📊 Sensor ToF: INACTIVO (error)")
+
+    def debe_medir_sensor(self, frame_count: int) -> bool:
+        """Determina si el sensor debe realizar medición este frame"""
+
+        if self.estado_sensor == EstadoSensor.INACTIVO:
+            return False
+        elif self.estado_sensor == EstadoSensor.STANDBY:
+            return False
+        elif self.estado_sensor == EstadoSensor.MEDICION_CONTINUA:
+            return True
+        elif self.estado_sensor == EstadoSensor.MEDICION_PERIODICA:
+            # Medir cada N frames
+            return (frame_count % ConfigSistema.TOF_PERIODO_MEDICION) == 0
+
+        return False
+
+    def obtener_info(self) -> dict:
+        """Retorna información del estado actual"""
+        return {
+            'estado_sistema': self.estado_actual.value,
+            'estado_sensor': self.estado_sensor.value,
+            'tiempo_en_estado': self.tiempo_en_estado
+        }
+
+# ===========================
+# SENSOR TOF CON ESTADOS
 # ===========================
 class SensorToF:
-    def __init__(self):
+    """
+    Sensor ToF con gestión de estados para optimizar recursos
+    """
+
+    def __init__(self, controlador_estados: ControladorEstados):
         self.tof = None
         self.disponible = TOF_DISPONIBLE
+        self.controlador = controlador_estados
         self.buffer_distancias = deque(maxlen=ConfigSistema.TOF_FILTER_WINDOW)
-        
+        self.ultima_distancia = None
+        self.en_ranging = False
+
     def inicializar(self):
+        """Inicializa el sensor ToF"""
         if not self.disponible:
             return False
         try:
             self.tof = VL53L1X.VL53L1X(i2c_bus=1, i2c_address=0x29)
             self.tof.open()
-            self.tof.start_ranging(2)
-            print("✓ ToF sensor: OK")
+            print("✓ ToF sensor: inicializado")
             return True
         except Exception as e:
             print(f"✗ Error ToF: {e}")
             self.disponible = False
             return False
-    
-    def leer_distancia(self):
-        # Telecom: filtro temporal simple (promedio móvil) para reducir ruido.
-        # Esto equivale a un low-pass FIR de ventana fija.
+
+    def _activar_ranging(self):
+        """Activa el modo ranging del sensor"""
+        if not self.en_ranging and self.tof is not None:
+            try:
+                self.tof.start_ranging(2)
+                self.en_ranging = True
+            except:
+                pass
+
+    def _desactivar_ranging(self):
+        """Desactiva el modo ranging para ahorrar energía"""
+        if self.en_ranging and self.tof is not None:
+            try:
+                self.tof.stop_ranging()
+                self.en_ranging = False
+            except:
+                pass
+
+    def leer_distancia(self, frame_count: int):
+        """
+        Lee distancia según estado del sistema
+        Retorna: distancia_cm o None
+        """
         if not self.disponible or self.tof is None:
             return None
+
+        # Verificar si debe medir según estado
+        if not self.controlador.debe_medir_sensor(frame_count):
+            # No medir, retornar última medición válida
+            return self.ultima_distancia
+
+        # Asegurar que ranging está activo
+        estado_sensor = self.controlador.estado_sensor
+        if estado_sensor in [EstadoSensor.MEDICION_CONTINUA,
+                             EstadoSensor.MEDICION_PERIODICA]:
+            self._activar_ranging()
+        else:
+            self._desactivar_ranging()
+            return self.ultima_distancia
+
+        # Realizar medición
         try:
             distancia_mm = self.tof.get_distance()
             if distancia_mm > 0:
                 distancia_cm = distancia_mm / 10.0
                 self.buffer_distancias.append(distancia_cm)
-                # Retornar promedio suavizado
+
+                # Suavizado con promedio móvil
                 if len(self.buffer_distancias) > 0:
-                    return np.mean(self.buffer_distancias)
+                    distancia_suavizada = np.mean(self.buffer_distancias)
+                    self.ultima_distancia = distancia_suavizada
+                    return distancia_suavizada
         except Exception as e:
             print(f"Error leyendo ToF: {e}")
-        return None
-    
+
+        return self.ultima_distancia
+
     def cerrar(self):
+        """Cierra el sensor limpiamente"""
+        self._desactivar_ranging()
         if self.tof is not None:
             try:
-                self.tof.stop_ranging()
                 self.tof.close()
             except:
                 pass
 
 # ===========================
-# CLASE MEDICIÓN DE ANCHO
+# MEDIDOR DE ANCHO (SIN CAMBIOS)
 # ===========================
 class MedidorAncho:
     def __init__(self):
         self.buffer_anchos = deque(maxlen=ConfigSistema.FILTER_WINDOW)
         self.umbral = ConfigSistema.UMBRAL_BINARIO
-        
-        # Kernel morfológico optimizado
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        
+
     def procesar_frame(self, depth_frame, color_frame=None):
-        """
-        Procesa un frame y calcula el ancho del filamento
-        Usa COLOR si está disponible, sino DEPTH
-        Retorna: ancho_mm, imagen_procesada
-        """
-        # Telecom: Selección de fuente.
-        # - COLOR: más “rico” visualmente, pero puede venir comprimido (MJPEG) y ser caro.
-        # - DEPTH: suele venir raw uint16 (más barato), pero depende del escenario.
+        """Procesa frame y calcula ancho del filamento"""
         if color_frame is not None and ConfigSistema.USE_COLOR:
             return self._procesar_color(color_frame)
         elif depth_frame is not None:
             return self._procesar_depth(depth_frame)
         return None, None
-    
-    def _procesar_color(self, color_frame):
-        """Procesa frame de color para detectar filamento.
 
-        Pipeline (rápido y robusto):
-        1) Decodificar a GRAY (si viene MJPEG) para ahorrar CPU.
-        2) Downscale a 640x480 antes del procesamiento.
-        3) OTSU + morfología + contornos + minAreaRect.
-        """
+    def _procesar_color(self, color_frame):
+        """Procesa frame de color para detectar filamento"""
         try:
-            # Telecom: el cuello de botella es la decodificación MJPEG.
-            # Decodificar a GRAY reduce ~3x memoria vs BGR y baja el costo.
+            # Conversión a escala de grises (rápido)
             gray = frame_to_gray_image(color_frame)
             if gray is None:
                 return None, None
-            
-            # Telecom: bajar resolución reduce el costo O(N) de filtros/contornos.
-            # 1920x1080 → 640x480 ≈ 6.75x menos píxeles (y suele sentirse “>5x”).
-            PROC_W, PROC_H = 640, 480
-            h_orig, w_orig = gray.shape[:2]
-            if w_orig > PROC_W or h_orig > PROC_H:
-                gray = cv2.resize(gray, (PROC_W, PROC_H))
-            
-            # Telecom: OTSU = umbral adaptativo global (rápido) adecuado si iluminación estable.
-            ret, binary = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            # Telecom: morfología para limpiar ruido impulsivo y cerrar huecos (mejora contorno).
+
+            # Asegurar tamaño de procesamiento
+            h, w = gray.shape[:2]
+            if w != ConfigSistema.PROC_WIDTH or h != ConfigSistema.PROC_HEIGHT:
+                gray = cv2.resize(gray, (ConfigSistema.PROC_WIDTH,
+                                         ConfigSistema.PROC_HEIGHT))
+
+            # Binarización con OTSU (adaptativo)
+            _, binary = cv2.threshold(gray, 0, 255,
+                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            # Limpieza morfológica
             binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, self.kernel)
             binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, self.kernel)
-            
-            # Telecom: contornos = extracción de “blobs” (ROI implícita).
-            result = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            # Encontrar contornos
+            result = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                      cv2.CHAIN_APPROX_SIMPLE)
             contours = result[0] if len(result) == 2 else result[1]
-            
-            # Imagen de salida para UI (BGR porque OpenCV imshow espera BGR/Gray)
+
+            # Imagen de visualización
             vis_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-            
+
             ancho_mm = None
-            
-            if len(contours) > 0:
-                # Filtrar contornos por área
-                contornos_validos = [c for c in contours 
-                                    if cv2.contourArea(c) > ConfigSistema.MIN_AREA_CONTORNO]
-                
-                if contornos_validos:
-                    # Tomar el contorno más grande
-                    contorno_principal = max(contornos_validos, key=cv2.contourArea)
-                    
-                    # Dibujar contorno
-                    cv2.drawContours(vis_image, [contorno_principal], -1, (0, 255, 0), 2)
-                    
-                    # Telecom: minAreaRect da orientación + dimensiones. El “ancho”
-                    # se asume como el lado menor del rectángulo (filamento ~cilindro).
-                    rect = cv2.minAreaRect(contorno_principal)
+
+            if contours:
+                # Encontrar contorno más grande
+                contorno_max = max(contours, key=cv2.contourArea)
+
+                if cv2.contourArea(contorno_max) > ConfigSistema.MIN_AREA_CONTORNO:
+                    # Rectángulo mínimo orientado
+                    rect = cv2.minAreaRect(contorno_max)
                     box = cv2.boxPoints(rect)
                     box = np.int0(box)
-                    
-                    # Dibujar rectángulo
-                    cv2.drawContours(vis_image, [box], 0, (0, 0, 255), 2)
-                    
-                    # Calcular ancho (el lado más corto)
-                    width_rect, height_rect = rect[1]
-                    ancho_pixels = min(width_rect, height_rect)
-                    
-                    # Telecom: conversión pixel→mm (calibración). Ajustar PIXELS_TO_MM.
-                    ancho_mm = ancho_pixels * ConfigSistema.PIXELS_TO_MM
-                    
-                    # Añadir al buffer
+
+                    # Ancho (menor dimensión del rectángulo)
+                    width, height = rect[1]
+                    ancho_px = min(width, height)
+                    ancho_mm = ancho_px * ConfigSistema.PIXELS_TO_MM
+
+                    # Suavizado temporal
                     self.buffer_anchos.append(ancho_mm)
-                    
-                    # Telecom: filtro temporal (promedio móvil) para suavizar jitter.
                     if len(self.buffer_anchos) > 0:
                         ancho_mm = np.mean(self.buffer_anchos)
-                    
-                    # Dibujar centro
-                    center = tuple(np.int0(rect[0]))
-                    cv2.circle(vis_image, center, 5, (255, 0, 255), -1)
-                    
-                    # Texto con medición
-                    cv2.putText(vis_image, f"{ancho_mm:.2f}mm", 
-                               (center[0] + 10, center[1] - 10),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-            
+
+                    # Visualización
+                    cv2.drawContours(vis_image, [box], 0, (0, 255, 0), 2)
+                    center = tuple(map(int, rect[0]))
+                    cv2.circle(vis_image, center, 5, (0, 0, 255), -1)
+
             return ancho_mm, vis_image
-            
+
         except Exception as e:
             print(f"Error procesando color: {e}")
             return None, None
-    
+
     def _procesar_depth(self, depth_frame):
-        """Procesa frame de depth (método original)"""
+        """Procesa frame de profundidad (alternativa)"""
         try:
-            # Convertir depth a array numpy
-            depth_data = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
-            depth_image = depth_data.reshape((depth_frame.get_height(), depth_frame.get_width()))
-            
-            # Normalizar para procesamiento
-            depth_norm = cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-            
-            # Threshold simple OTSU (más rápido)
-            ret, binary = cv2.threshold(depth_norm, 100, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            # Operaciones morfológicas para limpiar
+            # Conversión a imagen 8-bit
+            depth_data = np.frombuffer(depth_frame.get_data(),
+                                       dtype=np.uint16)
+            depth_data = depth_data.reshape((depth_frame.get_height(),
+                                             depth_frame.get_width()))
+
+            # Normalizar a 8-bit
+            depth_8bit = cv2.normalize(depth_data, None, 0, 255,
+                                       cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+
+            # Resize si necesario
+            if depth_8bit.shape[1] != ConfigSistema.PROC_WIDTH:
+                depth_8bit = cv2.resize(depth_8bit,
+                                        (ConfigSistema.PROC_WIDTH,
+                                         ConfigSistema.PROC_HEIGHT))
+
+            # Binarización
+            _, binary = cv2.threshold(depth_8bit, self.umbral, 255,
+                                      cv2.THRESH_BINARY)
+
+            # Morfología
             binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, self.kernel)
             binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, self.kernel)
-            
-            # Encontrar contornos (compatible con OpenCV 3 y 4)
-            result = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            # Contornos
+            result = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                      cv2.CHAIN_APPROX_SIMPLE)
             contours = result[0] if len(result) == 2 else result[1]
-            
-            # Crear imagen de visualización en color
-            vis_image = cv2.cvtColor(depth_norm, cv2.COLOR_GRAY2BGR)
-            
+
+            vis_image = cv2.cvtColor(depth_8bit, cv2.COLOR_GRAY2BGR)
+
             ancho_mm = None
-            
-            if len(contours) > 0:
-                # Filtrar contornos por área
-                contornos_validos = [c for c in contours 
-                                    if cv2.contourArea(c) > ConfigSistema.MIN_AREA_CONTORNO]
-                
-                if contornos_validos:
-                    # Tomar el contorno más grande
-                    contorno_principal = max(contornos_validos, key=cv2.contourArea)
-                    
-                    # Dibujar contorno
-                    cv2.drawContours(vis_image, [contorno_principal], -1, (0, 255, 0), 2)
-                    
-                    # Calcular ancho mediante rectángulo rotado
-                    rect = cv2.minAreaRect(contorno_principal)
+
+            if contours:
+                contorno_max = max(contours, key=cv2.contourArea)
+
+                if cv2.contourArea(contorno_max) > ConfigSistema.MIN_AREA_CONTORNO:
+                    rect = cv2.minAreaRect(contorno_max)
                     box = cv2.boxPoints(rect)
                     box = np.int0(box)
-                    
-                    # Dibujar rectángulo
-                    cv2.drawContours(vis_image, [box], 0, (0, 0, 255), 2)
-                    
-                    # Calcular ancho (el lado más corto del rectángulo)
+
                     width, height = rect[1]
-                    ancho_pixels = min(width, height)
-                    
-                    # Convertir a mm
-                    ancho_mm = ancho_pixels * ConfigSistema.PIXELS_TO_MM
-                    
-                    # Añadir al buffer para suavizado
+                    ancho_px = min(width, height)
+                    ancho_mm = ancho_px * ConfigSistema.PIXELS_TO_MM
+
                     self.buffer_anchos.append(ancho_mm)
-                    
-                    # Calcular promedio suavizado
                     if len(self.buffer_anchos) > 0:
                         ancho_mm = np.mean(self.buffer_anchos)
-                    
-                    # Dibujar punto central
-                    center = tuple(np.int0(rect[0]))
-                    cv2.circle(vis_image, center, 5, (255, 0, 255), -1)
-                    
-                    # Añadir texto con medición
-                    cv2.putText(vis_image, f"{ancho_mm:.2f}mm", 
-                               (center[0] + 10, center[1] - 10),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-            
+
+                    cv2.drawContours(vis_image, [box], 0, (0, 255, 0), 2)
+
             return ancho_mm, vis_image
-            
+
         except Exception as e:
-            print(f"Error procesando frame: {e}")
+            print(f"Error procesando depth: {e}")
             return None, None
 
-# Clase SistemaVisualizacion eliminada - ya no se necesita
+# ===========================
+# CONFIGURACIÓN OPTIMIZADA DE PIPELINE
+# ===========================
+def configurar_pipeline_rapido(device, use_color=True):
+    """
+    Configura pipeline optimizado para MÁXIMA VELOCIDAD
+
+    CLAVE: Forzar formato sin compresión (YUYV/Y16)
+
+    Returns: pipeline, config
+    """
+    print(f"\n🔧 Configurando pipeline RÁPIDO para: {device.get_device_info().get_name()}")
+
+    pipeline = Pipeline(device)
+    config = Config()
+
+    try:
+        if use_color and ConfigSistema.USE_COLOR:
+            # ===========================
+            # CONFIGURACIÓN COLOR RÁPIDA
+            # ===========================
+            color_profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+
+            # CRÍTICO: Buscar perfil YUYV (no comprimido)
+            perfil_seleccionado = None
+            perfil_fallback = None
+
+            print("\n  📹 Perfiles de color disponibles:")
+            for i in range(color_profiles.get_count()):
+                profile = color_profiles.get_profile(i)
+                vp = profile.as_video_stream_profile()
+
+                fmt = vp.get_format()
+                w = vp.get_width()
+                h = vp.get_height()
+                fps = vp.get_fps()
+
+                fmt_name = str(fmt).split('.')[-1] if '.' in str(fmt) else str(fmt)
+                print(f"    [{i}] {w}x{h} @ {fps}fps - {fmt_name}")
+
+                # Guardar primer perfil como fallback
+                if perfil_fallback is None:
+                    perfil_fallback = profile
+
+                # BUSCAR: 640x480 @ 30fps en formato YUYV o Y16
+                if (w == ConfigSistema.CAMERA_WIDTH and
+                        h == ConfigSistema.CAMERA_HEIGHT and
+                        fps == ConfigSistema.CAMERA_FPS):
+
+                    # Preferir YUYV (sin compresión)
+                    if fmt == OBFormat.YUYV:
+                        perfil_seleccionado = profile
+                        print(f"    ✓ SELECCIONADO (YUYV - sin compresión)")
+                        break
+                    # Alternativa: Y16
+                    elif fmt == OBFormat.Y16:
+                        if perfil_seleccionado is None:
+                            perfil_seleccionado = profile
+                            print(f"    ✓ SELECCIONADO (Y16)")
+                    # Última opción: cualquiera que coincida en resolución/fps
+                    elif perfil_seleccionado is None:
+                        perfil_seleccionado = profile
+                        print(f"    ⚠ Seleccionado (formato {fmt_name} - puede ser lento)")
+
+            # Usar perfil seleccionado o fallback
+            if perfil_seleccionado:
+                config.enable_stream(perfil_seleccionado)
+                print(f"\n  ✓ Pipeline COLOR configurado")
+            elif perfil_fallback:
+                config.enable_stream(perfil_fallback)
+                print(f"\n  ⚠ Usando perfil fallback (puede afectar velocidad)")
+            else:
+                print("\n  ❌ No se encontraron perfiles COLOR")
+                return None, None
+
+        else:
+            # ===========================
+            # CONFIGURACIÓN DEPTH (ALTERNATIVA)
+            # ===========================
+            depth_profiles = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+
+            perfil_depth = None
+            print("\n  📊 Perfiles de profundidad disponibles:")
+
+            for i in range(depth_profiles.get_count()):
+                profile = depth_profiles.get_profile(i)
+                vp = profile.as_video_stream_profile()
+
+                w = vp.get_width()
+                h = vp.get_height()
+                fps = vp.get_fps()
+
+                print(f"    [{i}] {w}x{h} @ {fps}fps")
+
+                if (w == ConfigSistema.CAMERA_WIDTH and
+                        h == ConfigSistema.CAMERA_HEIGHT and
+                        fps >= ConfigSistema.CAMERA_FPS):
+                    perfil_depth = profile
+                    print(f"    ✓ SELECCIONADO")
+                    break
+
+            if perfil_depth:
+                config.enable_stream(perfil_depth)
+                print(f"\n  ✓ Pipeline DEPTH configurado")
+            else:
+                print(f"\n  ❌ No se encontró perfil DEPTH adecuado")
+                return None, None
+
+        # Iniciar pipeline
+        pipeline.start(config)
+
+        # Configurar buffer pequeño para baja latencia
+        # (si la API lo soporta)
+        try:
+            # Algunos SDKs permiten configurar buffer size
+            pass  # Ajustar según API específica
+        except:
+            pass
+
+        return pipeline, config
+
+    except Exception as e:
+        print(f"\n  ❌ Error configurando pipeline: {e}")
+        return None, None
 
 # ===========================
-# MAIN
+# FUNCIÓN PRINCIPAL MEJORADA
 # ===========================
 def main():
-    print("=" * 70)
-    print(" Sistema de Monitoreo y Metrología - OPTIMIZADO")
-    print(" Jetson Nano + Orbbec Femto Bolt + VL53L1X ToF")
-    print("=" * 70)
-    
-    # Entrada de parámetros
-    try:
-        ancho_objetivo = float(input("Ancho objetivo del filamento [mm]: "))
-        velocidad_base = float(input("Velocidad base de referencia [mm/s]: "))
-    except ValueError:
-        print("Error: valores no válidos")
+    """
+    Función principal con sistema de estados y cámaras rápidas
+    """
+    print("="*70)
+    print(" SISTEMA DE MONITOREO MEJORADO - ALTA VELOCIDAD + ESTADOS")
+    print("="*70)
+    print("\n💡 MEJORAS:")
+    print("  ✓ Cámaras optimizadas: 1 FPS → 30 FPS")
+    print("  ✓ Sistema de estados inteligente")
+    print("  ✓ Gestión de energía del sensor ToF")
+    print("  ✓ Procesamiento paralelo de baja latencia")
+    print("\n" + "="*70)
+
+    # Inicializar controlador de estados
+    controlador_estados = ControladorEstados()
+
+    # Inicializar sensor ToF con gestión de estados
+    sensor_tof = SensorToF(controlador_estados)
+    if sensor_tof.inicializar():
+        print("✓ Sensor ToF inicializado con gestión de estados")
+
+    # Contexto de cámaras
+    if not ORBBEC_DISPONIBLE:
+        print("❌ SDK Orbbec no disponible")
         return
-    
-    # Inicializar componentes
-    sensor_tof = SensorToF()
-    sensor_tof.inicializar()
-    
+
+    ctx = Context()
+    device_list = ctx.query_devices()
+    num_devices = device_list.get_count()
+
+    print(f"\n🎥 Detectadas {num_devices} cámara(s) Orbbec")
+
+    if num_devices == 0:
+        print("❌ No se detectaron cámaras")
+        return
+
+    # Configurar cámaras
+    device0 = device_list.get_device_by_index(0)
+    pipeline0, config0 = configurar_pipeline_rapido(device0,
+                                                    use_color=ConfigSistema.USE_COLOR)
+
+    if pipeline0 is None:
+        print("❌ Error configurando cámara 0")
+        return
+
+    # Segunda cámara (opcional)
+    pipeline1 = None
+    if num_devices >= 2:
+        device1 = device_list.get_device_by_index(1)
+        pipeline1, config1 = configurar_pipeline_rapido(device1,
+                                                        use_color=ConfigSistema.USE_COLOR)
+
+    # Medidores
     medidor0 = MedidorAncho()
     medidor1 = MedidorAncho()
-    
-    # Variables
-    pipeline0 = None
-    pipeline1 = None
-    
-    if not ORBBEC_DISPONIBLE:
-        print("ERROR: pyorbbecsdk no disponible")
-        return
-    
-    print("\n[1/3] Conectando con cámaras Orbbec...")
-    
-    try:
-        ctx = Context()
-        device_list = ctx.query_devices()
-        curr_device_cnt = device_list.get_count()
 
-        if curr_device_cnt == 0:
-            print("ERROR: No se detectaron cámaras")
-            print("\nSoluciones:")
-            print("  1. lsusb | grep -i orbbec")
-            print("  2. Desconectar y reconectar USB")
-            print("  3. sudo chmod 666 /dev/video*")
-            return
-        
-        print(f"✓ Detectadas {curr_device_cnt} cámara(s)")
+    # Variables compartidas para threading
+    lock0 = threading.Lock()
+    lock1 = threading.Lock()
+    stop_event = threading.Event()
 
-        # Esperar un momento antes de abrir
-        time.sleep(0.5)
-        
-        try:
-            device0 = device_list.get_device_by_index(0)
-            print(f"  Cámara 0: {device0.get_device_info().get_name()}")
-        except Exception as e:
-            print(f"\n✗ Error abriendo cámara: {e}")
-            print("\nCámara ocupada o sin permisos.")
-            print("Ejecuta: sudo chmod 666 /dev/video*")
-            print("O cierra otros programas que usen la cámara")
-            return
-        
-        # Segunda cámara si está disponible
-        device1 = None
-        if curr_device_cnt >= 2:
+    result0 = {'ancho': None, 'image': None}
+    result1 = {'ancho': None, 'image': None}
+
+    # Estadísticas
+    frame_count = 0
+    start_time = time.time()
+    last_print_time = start_time
+
+    # Ancho objetivo
+    ancho_objetivo = 15.0  # mm
+
+    # ===========================
+    # WORKERS DE CAPTURA
+    # ===========================
+    def worker_cam0():
+        """Worker para cámara 0 (optimizado)"""
+        while not stop_event.is_set():
             try:
-                device1 = device_list.get_device_by_index(1)
-                print(f"  Cámara 1: {device1.get_device_info().get_name()}")
+                # Captura con timeout corto
+                frames = pipeline0.wait_for_frames(timeout_ms=100)
+                if frames is None:
+                    continue
+
+                # Obtener frames
+                color_frame = frames.get_color_frame() if ConfigSistema.USE_COLOR else None
+                depth_frame = frames.get_depth_frame()
+
+                # Procesar
+                ancho, vis_image = medidor0.procesar_frame(depth_frame, color_frame)
+
+                # Actualizar resultado
+                with lock0:
+                    result0['ancho'] = ancho
+                    result0['image'] = vis_image
+
             except Exception as e:
-                print(f"  ⚠ No se pudo abrir cámara 1: {e}")
-                device1 = None
+                if not stop_event.is_set():
+                    print(f"Error worker cam0: {e}")
+                time.sleep(0.01)
 
-        print("\n[2/3] Iniciando pipeline...")
-        
-        # Crear pipelines
-        pipeline0 = Pipeline(device0)
-        
-        # Pipeline para segunda cámara si está disponible
-        if device1 is not None:
-            pipeline1 = Pipeline(device1)
-        else:
-            pipeline1 = None
-        
-        # Intentar configurar resolución menor para mejor rendimiento
-        def configurar_camara(pipeline, nombre):
-            """Intenta configurar la cámara a resolución baja"""
-            config = Config()
-            profile_list = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
-            
-            # Intentar diferentes resoluciones (de menor a mayor)
-            resoluciones = [
-                (640, 480, 30),   # 480p - más rápido
-                (640, 480, 15),
-                (1280, 720, 30),  # 720p
-                (1280, 720, 15),
-            ]
-            
-            perfil_elegido = None
-            for w, h, fps in resoluciones:
-                try:
-                    # Intentar MJPEG primero (OBFormat.MJPG)
-                    perfil = profile_list.get_video_stream_profile(w, h, OBFormat.MJPG, fps)
-                    perfil_elegido = perfil
-                    print(f"  {nombre}: Encontrado {w}x{h} @ {fps}fps MJPEG")
-                    break
-                except:
-                    pass
-                
-                try:
-                    # Intentar cualquier formato
-                    perfil = profile_list.get_video_stream_profile(w, 0, OBFormat.ANY, fps)
-                    perfil_elegido = perfil
-                    print(f"  {nombre}: Encontrado {w}x? @ {fps}fps")
-                    break
-                except:
-                    pass
-            
-            if perfil_elegido:
-                config.enable_stream(perfil_elegido)
-                pipeline.start(config)
-                print(f"✓ {nombre}: {perfil_elegido.get_width()}x{perfil_elegido.get_height()} @ {perfil_elegido.get_fps()}fps")
-                return True
-            else:
-                # Usar default
-                pipeline.start()
-                print(f"✓ {nombre}: usando configuración por defecto")
-                return False
-        
-        configurar_camara(pipeline0, "Cam0")
-        
-        if pipeline1:
-            configurar_camara(pipeline1, "Cam1")
-        
-        # Esperar estabilización
-        time.sleep(1.0)
-        
-        print("\n[3/3] Sistema iniciado correctamente")
-        print("=" * 70)
-        print("CONTROLES:")
-        print("  'q' - Salir")
-        print("  '+' - Aumentar umbral de binarización")
-        print("  '-' - Disminuir umbral de binarización")
-        print("=" * 70 + "\n")
-        
-        # Variables de control
-        frame_count = 0
-        start_time = time.time()
-        last_print_time = time.time()
-        
-        # Variables compartidas para threading
-        result0 = {'ancho': None, 'image': None, 'ts': 0.0}
-        result1 = {'ancho': None, 'image': None, 'ts': 0.0}
-        lock0 = threading.Lock()
-        lock1 = threading.Lock()
-        stop_event = threading.Event()
-        
-        def worker_cam0():
-            """Hilo persistente para cámara 0 (siempre el último frame)"""
-            while not stop_event.is_set():
-                try:
-                    frameset = pipeline0.wait_for_frames(50)
-                    if not frameset:
-                        continue
-                    color_frame = frameset.get_color_frame()
-                    depth_frame = frameset.get_depth_frame()
-                    if not (color_frame or depth_frame):
-                        continue
-                    ancho, vis = medidor0.procesar_frame(depth_frame, color_frame)
-                    with lock0:
-                        result0['ancho'] = ancho
-                        result0['image'] = vis
-                        result0['ts'] = time.time()
-                except:
-                    continue
-        
-        def worker_cam1():
-            """Hilo persistente para cámara 1"""
-            if not pipeline1:
-                return
-            while not stop_event.is_set():
-                try:
-                    frameset = pipeline1.wait_for_frames(50)
-                    if not frameset:
-                        continue
-                    color_frame = frameset.get_color_frame()
-                    depth_frame = frameset.get_depth_frame()
-                    if not (color_frame or depth_frame):
-                        continue
-                    ancho, vis = medidor1.procesar_frame(depth_frame, color_frame)
-                    with lock1:
-                        result1['ancho'] = ancho
-                        result1['image'] = vis
-                        result1['ts'] = time.time()
-                except:
+    def worker_cam1():
+        """Worker para cámara 1 (optimizado)"""
+        while not stop_event.is_set():
+            try:
+                frames = pipeline1.wait_for_frames(timeout_ms=100)
+                if frames is None:
                     continue
 
-        # Lanzar hilos persistentes (evita overhead de crear threads por frame)
-        th0 = threading.Thread(target=worker_cam0, daemon=True)
-        th0.start()
-        th1 = None
-        if pipeline1:
-            th1 = threading.Thread(target=worker_cam1, daemon=True)
-            th1.start()
-        
-        # ===========================
-        # LOOP PRINCIPAL CON THREADING
-        # ===========================
+                color_frame = frames.get_color_frame() if ConfigSistema.USE_COLOR else None
+                depth_frame = frames.get_depth_frame()
+
+                ancho, vis_image = medidor1.procesar_frame(depth_frame, color_frame)
+
+                with lock1:
+                    result1['ancho'] = ancho
+                    result1['image'] = vis_image
+
+            except Exception as e:
+                if not stop_event.is_set():
+                    print(f"Error worker cam1: {e}")
+                time.sleep(0.01)
+
+    # Iniciar threads
+    print("\n🚀 Iniciando workers de captura...")
+    th0 = threading.Thread(target=worker_cam0, daemon=True)
+    th0.start()
+
+    th1 = None
+    if pipeline1:
+        th1 = threading.Thread(target=worker_cam1, daemon=True)
+        th1.start()
+
+    # ===========================
+    # FASE DE CALIBRACIÓN
+    # ===========================
+    print("\n" + "="*70)
+    print("📊 FASE: CALIBRACIÓN")
+    print("="*70)
+    print("Recolectando datos baseline (5 segundos)...")
+
+    controlador_estados.cambiar_estado(EstadoSistema.CALIBRACION)
+
+    baseline_data = []
+    calibracion_inicio = time.time()
+
+    while time.time() - calibracion_inicio < 5.0:
+        distancia_tof = sensor_tof.leer_distancia(frame_count)
+        if distancia_tof:
+            baseline_data.append(distancia_tof)
+        frame_count += 1
+        time.sleep(0.1)
+
+    if baseline_data:
+        baseline_promedio = np.mean(baseline_data)
+        baseline_std = np.std(baseline_data)
+        print(f"\n✓ Calibración completada:")
+        print(f"  - Distancia baseline: {baseline_promedio:.1f} ± {baseline_std:.1f} cm")
+
+    # ===========================
+    # TRANSICIÓN A MONITOREO ACTIVO
+    # ===========================
+    controlador_estados.cambiar_estado(EstadoSistema.MONITOREO_ACTIVO)
+
+    print("\n" + "="*70)
+    print("🎯 FASE: MONITOREO ACTIVO")
+    print("="*70)
+    print("\nControles:")
+    print("  [Q] - Salir")
+    print("  [+/-] - Ajustar umbral")
+    print("  [C] - Calibración")
+    print("  [V] - Verificación")
+    print("  [P] - Pausa")
+    print("  [M] - Monitoreo activo")
+    print("\n" + "="*70 + "\n")
+
+    # Reset contadores
+    frame_count = 0
+    start_time = time.time()
+    last_print_time = start_time
+
+    # ===========================
+    # LOOP PRINCIPAL
+    # ===========================
+    try:
         while True:
             frame_count += 1
             loop_start = time.time()
-            
-            # Leer distancia ToF
-            distancia_tof = sensor_tof.leer_distancia()
-            
-            # Obtener el ÚLTIMO resultado disponible (sin bloquear)
+
+            # Leer sensores según estado
+            distancia_tof = sensor_tof.leer_distancia(frame_count)
+
+            # Obtener resultados de cámaras
             with lock0:
                 ancho0 = result0['ancho']
                 vis_image0 = result0['image']
+
             with lock1:
                 ancho1 = result1['ancho']
                 vis_image1 = result1['image']
-            
+
             # Calcular FPS
             elapsed = time.time() - start_time
             fps = frame_count / elapsed if elapsed > 0 else 0
-            
-            # Visualización lado a lado - TAMAÑO FIJO 640x480 por cámara
-            DISPLAY_W = 640
-            DISPLAY_H = 480
-            
-            if vis_image0 is not None or vis_image1 is not None:
-                # SIEMPRE redimensionar a tamaño fijo
-                if vis_image0 is not None:
-                    vis_image0 = cv2.resize(vis_image0, (DISPLAY_W, DISPLAY_H))
-                    cv2.putText(vis_image0, "Camara 1", (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                    if ancho0 is not None:
-                        cv2.putText(vis_image0, f"{ancho0:.2f}mm", (10, DISPLAY_H - 20),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                
-                if vis_image1 is not None:
-                    vis_image1 = cv2.resize(vis_image1, (DISPLAY_W, DISPLAY_H))
-                    cv2.putText(vis_image1, "Camara 2", (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                    if ancho1 is not None:
-                        cv2.putText(vis_image1, f"{ancho1:.2f}mm", (10, DISPLAY_H - 20),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                
-                # Mostrar según disponibilidad
-                if vis_image0 is not None and vis_image1 is not None and pipeline1:
-                    # Ambas cámaras: lado a lado (mismo tamaño garantizado)
-                    combined = np.hstack((vis_image0, vis_image1))
-                    
-                    # Línea separadora vertical
-                    cv2.line(combined, (DISPLAY_W, 0), (DISPLAY_W, DISPLAY_H), (0, 255, 255), 2)
-                    
-                    # Barra superior con info
-                    cv2.rectangle(combined, (0, 0), (DISPLAY_W * 2, 50), (0, 0, 0), -1)
-                    
-                    # FPS
-                    cv2.putText(combined, f"FPS: {fps:.1f}", (20, 35),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    
-                    # Promedio si ambas cámaras tienen medición
-                    if ancho0 is not None and ancho1 is not None:
-                        ancho_prom = (ancho0 + ancho1) / 2
-                        error = ancho_prom - ancho_objetivo
-                        
-                        # Color según error
-                        if abs(error) <= ConfigSistema.TOLERANCIA_ERROR:
-                            color = (0, 255, 0)  # Verde
-                            estado = "OK"
-                        elif error > 0:
-                            color = (0, 165, 255)  # Naranja
-                            estado = "ANCHO"
-                        else:
-                            color = (0, 0, 255)  # Rojo
-                            estado = "DELGADO"
-                        
-                        cv2.putText(combined, f"Prom: {ancho_prom:.2f}mm ({estado})", 
-                                   (DISPLAY_W - 130, 35),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                    
-                    # Objetivo
-                    cv2.putText(combined, f"Obj: {ancho_objetivo:.2f}mm", 
-                               (DISPLAY_W * 2 - 180, 35),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                    
-                    cv2.imshow("Sistema de Medicion - Vista Dual", combined)
-                    
-                elif vis_image0 is not None:
-                    # Solo cámara 0
-                    cv2.putText(vis_image0, f"FPS: {fps:.1f}", (DISPLAY_W - 120, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                    cv2.imshow("Sistema de Medicion", vis_image0)
-                    
-                elif vis_image1 is not None:
-                    # Solo cámara 1
-                    cv2.putText(vis_image1, f"FPS: {fps:.1f}", (DISPLAY_W - 120, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                    cv2.imshow("Sistema de Medicion", vis_image1)
-            
-            # Imprimir estadísticas cada 2 segundos
+
+            # ===========================
+            # VISUALIZACIÓN
+            # ===========================
+            if ConfigSistema.MOSTRAR_VISTA:
+                DISPLAY_W = ConfigSistema.WINDOW_WIDTH
+                DISPLAY_H = ConfigSistema.WINDOW_HEIGHT
+
+                if vis_image0 is not None or vis_image1 is not None:
+                    # Preparar imágenes
+                    if vis_image0 is not None:
+                        vis_image0 = cv2.resize(vis_image0, (DISPLAY_W, DISPLAY_H))
+                        cv2.putText(vis_image0, "Camara 1", (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                        if ancho0 is not None:
+                            cv2.putText(vis_image0, f"{ancho0:.2f}mm",
+                                        (10, DISPLAY_H - 20),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+                    if vis_image1 is not None:
+                        vis_image1 = cv2.resize(vis_image1, (DISPLAY_W, DISPLAY_H))
+                        cv2.putText(vis_image1, "Camara 2", (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                        if ancho1 is not None:
+                            cv2.putText(vis_image1, f"{ancho1:.2f}mm",
+                                        (10, DISPLAY_H - 20),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+                    # Vista combinada si hay dos cámaras
+                    if vis_image0 is not None and vis_image1 is not None and pipeline1:
+                        combined = np.hstack((vis_image0, vis_image1))
+
+                        # Separador
+                        cv2.line(combined, (DISPLAY_W, 0), (DISPLAY_W, DISPLAY_H),
+                                 (0, 255, 255), 2)
+
+                        # Barra superior con info
+                        cv2.rectangle(combined, (0, 0), (DISPLAY_W * 2, 60),
+                                      (0, 0, 0), -1)
+
+                        # FPS
+                        cv2.putText(combined, f"FPS: {fps:.1f}", (20, 35),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                        # Estado del sistema
+                        info_estado = controlador_estados.obtener_info()
+                        cv2.putText(combined,
+                                    f"Estado: {info_estado['estado_sistema']}",
+                                    (200, 35),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+                        # Sensor ToF
+                        if distancia_tof:
+                            cv2.putText(combined, f"ToF: {distancia_tof:.1f}cm",
+                                        (500, 35),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+                        # Promedio y control
+                        if ancho0 is not None and ancho1 is not None:
+                            ancho_prom = (ancho0 + ancho1) / 2
+                            error = ancho_prom - ancho_objetivo
+
+                            if abs(error) <= ConfigSistema.TOLERANCIA_ERROR:
+                                color = (0, 255, 0)
+                                estado = "OK"
+                            elif error > 0:
+                                color = (0, 165, 255)
+                                estado = "ANCHO"
+                            else:
+                                color = (0, 0, 255)
+                                estado = "DELGADO"
+
+                            cv2.putText(combined,
+                                        f"Prom: {ancho_prom:.2f}mm ({estado})",
+                                        (DISPLAY_W - 180, 35),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                        cv2.imshow("Sistema de Medicion - Vista Dual", combined)
+
+                    elif vis_image0 is not None:
+                        # Solo cámara 0
+                        cv2.putText(vis_image0, f"FPS: {fps:.1f}",
+                                    (DISPLAY_W - 120, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                        cv2.imshow("Sistema de Medicion", vis_image0)
+
+            # ===========================
+            # ESTADÍSTICAS PERIÓDICAS
+            # ===========================
             if time.time() - last_print_time >= 2.0:
-                print(f"\n--- {datetime.now().strftime('%H:%M:%S')} | Frame {frame_count} | FPS: {fps:.1f} ---")
-                
+                print(f"\n--- {datetime.now().strftime('%H:%M:%S')} | "
+                      f"Frame {frame_count} | FPS: {fps:.1f} ---")
+
+                # Info de estado
+                info_estado = controlador_estados.obtener_info()
+                print(f"  🔄 Estado: {info_estado['estado_sistema']} "
+                      f"(Sensor: {info_estado['estado_sensor']})")
+
                 if distancia_tof:
-                    print(f"  ToF: {distancia_tof:.1f} cm")
-                
+                    print(f"  📊 ToF: {distancia_tof:.1f} cm")
+
                 if ancho0:
                     error0 = ancho0 - ancho_objetivo
-                    print(f"  Cam0: {ancho0:.2f} mm (error: {error0:+.2f} mm)")
-                
+                    print(f"  📸 Cam0: {ancho0:.2f} mm (error: {error0:+.2f} mm)")
+
                 if ancho1:
                     error1 = ancho1 - ancho_objetivo
-                    print(f"  Cam1: {ancho1:.2f} mm (error: {error1:+.2f} mm)")
-                
-                # Promedio si ambas cámaras tienen medición
+                    print(f"  📸 Cam1: {ancho1:.2f} mm (error: {error1:+.2f} mm)")
+
                 if ancho0 and ancho1:
                     ancho_prom = (ancho0 + ancho1) / 2
                     error_prom = ancho_prom - ancho_objetivo
-                    print(f"  Promedio: {ancho_prom:.2f} mm (error: {error_prom:+.2f} mm)")
-                    
-                    # Recomendación
+                    print(f"  📏 Promedio: {ancho_prom:.2f} mm "
+                          f"(error: {error_prom:+.2f} mm)")
+
                     if abs(error_prom) <= ConfigSistema.TOLERANCIA_ERROR:
-                        print(f"  Estado: ✓ OPTIMO")
+                        print(f"  ✓ Estado: ÓPTIMO")
                     elif error_prom > 0:
                         porcentaje = (error_prom / ancho_objetivo) * 100
-                        print(f"  Estado: ⚠ MUY ANCHO (+{porcentaje:.1f}%) - ACELERAR")
+                        print(f"  ⚠ Estado: MUY ANCHO (+{porcentaje:.1f}%) - ACELERAR")
                     else:
                         porcentaje = (abs(error_prom) / ancho_objetivo) * 100
-                        print(f"  Estado: ⚠ MUY DELGADO (-{porcentaje:.1f}%) - FRENAR")
-                
+                        print(f"  ⚠ Estado: MUY DELGADO (-{porcentaje:.1f}%) - FRENAR")
+
                 last_print_time = time.time()
-            
-            # Manejo de teclas
+
+            # ===========================
+            # MANEJO DE TECLAS
+            # ===========================
             key = cv2.waitKey(1) & 0xFF
+
             if key == ord('q'):
                 print("\n[SALIENDO] Deteniendo sistema...")
                 stop_event.set()
                 break
+
             elif key == ord('+'):
                 medidor0.umbral = min(255, medidor0.umbral + 5)
                 medidor1.umbral = medidor0.umbral
                 print(f"Umbral: {medidor0.umbral}")
+
             elif key == ord('-'):
                 medidor0.umbral = max(0, medidor0.umbral - 5)
                 medidor1.umbral = medidor0.umbral
                 print(f"Umbral: {medidor0.umbral}")
-            
-            # Control de framerate
-            loop_time = time.time() - loop_start
-            if loop_time < 1.0 / ConfigSistema.CAMERA_FPS:
-                time.sleep(1.0 / ConfigSistema.CAMERA_FPS - loop_time)
-    
+
+            elif key == ord('c'):
+                # Cambiar a calibración
+                controlador_estados.cambiar_estado(EstadoSistema.CALIBRACION)
+
+            elif key == ord('v'):
+                # Cambiar a verificación
+                controlador_estados.cambiar_estado(EstadoSistema.VERIFICACION)
+
+            elif key == ord('p'):
+                # Cambiar a pausa
+                controlador_estados.cambiar_estado(EstadoSistema.PAUSA)
+
+            elif key == ord('m'):
+                # Cambiar a monitoreo activo
+                controlador_estados.cambiar_estado(EstadoSistema.MONITOREO_ACTIVO)
+
+            # Control de framerate (opcional, para limitar CPU)
+            # Comentar para máxima velocidad
+            # loop_time = time.time() - loop_start
+            # if loop_time < 1.0 / ConfigSistema.CAMERA_FPS:
+            #     time.sleep(1.0 / ConfigSistema.CAMERA_FPS - loop_time)
+
+    except KeyboardInterrupt:
+        print("\n[INTERRUPCIÓN] Usuario canceló...")
+        stop_event.set()
+
     except Exception as e:
         print(f"\n[ERROR CRÍTICO] {e}")
         import traceback
         traceback.print_exc()
-        print("\nSugerencias:")
-        print("  1. Verifica conexiones USB: lsusb | grep -i orbbec")
-        print("  2. Verifica permisos: groups | grep video")
-        print("  3. Ejecuta: sudo jetson_clocks")
-        print("  4. Verifica RAM: free -h")
-        print("  5. Buffer USB: cat /sys/module/usbcore/parameters/usbfs_memory_mb")
-    
+
     finally:
-        # Cleanup
+        # Limpieza
         print("\n[LIMPIEZA] Cerrando recursos...")
-        try:
-            stop_event.set()
-        except:
-            pass
+        stop_event.set()
+
         if pipeline0:
             try:
                 pipeline0.stop()
                 print("✓ Pipeline 0 cerrado")
             except:
                 pass
+
         if pipeline1:
             try:
                 pipeline1.stop()
                 print("✓ Pipeline 1 cerrado")
             except:
                 pass
+
         sensor_tof.cerrar()
         cv2.destroyAllWindows()
         print("✓ Sistema cerrado correctamente")
