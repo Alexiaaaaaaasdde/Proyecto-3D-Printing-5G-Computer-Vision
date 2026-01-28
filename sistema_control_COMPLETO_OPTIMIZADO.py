@@ -108,7 +108,7 @@ class ConfigSistema:
     CAMERA_HEIGHT = 480
     CAMERA_FPS = 30             # FPS objetivo REAL
 
-    # CRÍTICO: Usar formato sin compresión
+    # Formato sin compresión
     USE_COLOR = True
     FORCE_UNCOMPRESSED = True    # Forzar YUYV/Y16 (NO MJPEG)
 
@@ -118,7 +118,7 @@ class ConfigSistema:
     # ===========================
     # PROCESAMIENTO
     # ===========================
-    # Resolución de procesamiento (puede ser < resolución cámara)
+    # Resolución de procesamiento
     PROC_WIDTH = 640
     PROC_HEIGHT = 480
 
@@ -170,7 +170,7 @@ class ControladorEstados:
         if nuevo_estado == self.estado_actual:
             return
 
-        print(f"\n🔄 TRANSICIÓN: {self.estado_actual.value} → {nuevo_estado.value}")
+        print(f"\nTRANSICIÓN: {self.estado_actual.value} → {nuevo_estado.value}")
 
         self.tiempo_en_estado = time.time() - self.ultima_transicion
         self.estado_actual = nuevo_estado
@@ -185,27 +185,27 @@ class ControladorEstados:
         if self.estado_actual == EstadoSistema.CALIBRACION:
             # Calibración: medición continua para baseline
             self.estado_sensor = EstadoSensor.MEDICION_CONTINUA
-            print("  📊 Sensor ToF: MEDICION_CONTINUA (calibración)")
+            print("Sensor ToF: MEDICION_CONTINUA (calibración)")
 
         elif self.estado_actual == EstadoSistema.MONITOREO_ACTIVO:
             # Monitoreo: medición continua para control en tiempo real
             self.estado_sensor = EstadoSensor.MEDICION_CONTINUA
-            print("  📊 Sensor ToF: MEDICION_CONTINUA (control activo)")
+            print("Sensor ToF: MEDICION_CONTINUA (control activo)")
 
         elif self.estado_actual == EstadoSistema.VERIFICACION:
             # Verificación: medición periódica suficiente
             self.estado_sensor = EstadoSensor.MEDICION_PERIODICA
-            print("  📊 Sensor ToF: MEDICION_PERIODICA (ahorro energía)")
+            print("Sensor ToF: MEDICION_PERIODICA (ahorro energía)")
 
         elif self.estado_actual == EstadoSistema.PAUSA:
             # Pausa: standby para respuesta rápida
             self.estado_sensor = EstadoSensor.STANDBY
-            print("  📊 Sensor ToF: STANDBY (bajo consumo)")
+            print("Sensor ToF: STANDBY (bajo consumo)")
 
         elif self.estado_actual == EstadoSistema.ERROR:
             # Error: inactivo hasta resolución
             self.estado_sensor = EstadoSensor.INACTIVO
-            print("  📊 Sensor ToF: INACTIVO (error)")
+            print("Sensor ToF: INACTIVO (error)")
 
     def debe_medir_sensor(self, frame_count: int) -> bool:
         """Determina si el sensor debe realizar medición este frame"""
