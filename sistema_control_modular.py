@@ -20,9 +20,11 @@ Hardware: Jetson Nano + Cámaras Orbbec Femto Bolt + ToF VL53L1X
 Display: TV por HDMI (optimizado para visualización a distancia)
 
 NOTA: Este sistema NO controla el robot/impresora. Solo mide y muestra recomendaciones.
+
+VERSIÓN: Velocidad en mm/min (entrada, display y logging)
+Internamente el control sigue en m/s para mantener coherencia con saturaciones.
 """
 
-import sys
 import time
 from datetime import datetime
 import csv
@@ -60,28 +62,23 @@ class Config:
 
     # -------- ToF ----------
     TOF_ENABLED = True
-    TOF_I2C_BUS = 1            # Jetson Nano normalmente usa I2C-1 (pines 3/5)
-    TOF_I2C_ADDRESS = 0x29     # VL53L1X default
-    TOF_TIMING_BUDGET_MS = 50  # 20–50ms típico
+    TOF_I2C_BUS = 1
+    TOF_I2C_ADDRESS = 0x29
+    TOF_TIMING_BUDGET_MS = 50
     TOF_INTER_MEASUREMENT_MS = 60
 
-    TARGET_DISTANCE_MM = 200.0     # tu objetivo de distancia
-    TOF_FILTER_WINDOW = 5          # suavizado
+    TARGET_DISTANCE_MM = 200.0
+    TOF_FILTER_WINDOW = 5
 
-    # System Limits
-    MAX_DEVICES = 2
-    MAX_QUEUE_SIZE = 5
-
-    # Control Constants
+    # Control / print
     PRINT_INTERVAL = 2  # seconds
 
-    # Depth Filtering
-    MIN_DEPTH = 20  # 20mm
-    MAX_DEPTH = 1000  # 1000mm
-
-    # Robot Safety Limits (para cálculo teórico de recomendaciones)
-    MAX_SPEED = 0.15   # m/s - Maximum allowed speed
-    MIN_SPEED = 0.002  # m/s - Minimum allowed speed
+    # Robot Safety Limits
+    # Estos límites están en m/s (interno). Ejemplo:
+    # 0.15 m/s = 9000 mm/min
+    # 0.002 m/s = 120 mm/min
+    MAX_SPEED = 0.15
+    MIN_SPEED = 0.002
 
     # Image Processing / Metrology
     FACTOR_DISTANCIA = 0.324  # mm/pixel
@@ -95,17 +92,29 @@ class Config:
     CENTER_X = 270
     CENTER_Y = 270
 
-    # Default Control Params (para simulación de recomendaciones)
+    # Default Control Params (simulación de recomendaciones)
     DEFAULT_KP = 0.00025
     DEFAULT_KI = 0.00000
     DEFAULT_KD = 0.00000
 
     # GUI para TV
     HUD_PANEL_WIDTH = 500
-    HUD_PANEL_HEIGHT = 260   # <-- aumentado para texto del ToF
+    HUD_PANEL_HEIGHT = 260
     FONT_SCALE_LARGE = 2.0
     FONT_SCALE_MEDIUM = 1.5
     FONT_THICKNESS = 3
+
+    # Altura: paso de ajuste recomendado (mm/min)
+    HEIGHT_DELTA_MM_MIN = 50.0
+
+
+# Helpers de conversión
+def mm_min_to_mps(v_mm_min: float) -> float:
+    return v_mm_min / 1000.0 / 60.0
+
+
+def mps_to_mm_min(v_mps: float) -> float:
+    return v_mps * 1000.0 * 60.0
 
 
 class DataLogger:
@@ -122,17 +131,16 @@ class DataLogger:
         self.file = open(self.filename, 'w', newline='', encoding='utf-8')
         self.writer = csv.writer(self.file)
 
-        # Columnas (incluye ToF)
         self.writer.writerow([
             'Timestamp',
             'Ancho_Medido_mm', 'SetPoint_mm', 'Error_Ancho_mm',
-            'Velocidad_Recomendada_mps', 'Accion_Ancho',
+            'Velocidad_Recomendada_mm_min', 'Accion_Ancho',
             'P_term', 'I_term', 'D_term',
             'ToF_mm', 'Error_Distancia_mm', 'Accion_Altura'
         ])
         self.file.flush()
 
-    def log(self, width, setpoint, error_w, velocity_recommended, action_w,
+    def log(self, width, setpoint, error_w, velocity_recommended_mps, action_w,
             p_term, i_term, d_term, tof_mm, ed_mm, action_h):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         self.writer.writerow([
@@ -140,12 +148,12 @@ class DataLogger:
             round(width, 3),
             float(setpoint),
             round(error_w, 3),
-            round(velocity_recommended, 6),
+            round(mps_to_mm_min(velocity_recommended_mps), 2),
             action_w,
             round(p_term, 6),
             round(i_term, 6),
             round(d_term, 6),
-            (round(tof_mm, 1) if tof_mm == tof_mm else ""),   # NaN -> vacío
+            (round(tof_mm, 1) if tof_mm == tof_mm else ""),
             round(ed_mm, 1),
             action_h
         ])
@@ -169,21 +177,21 @@ class RecommendationSimulator:
         self.kd = kd
         self.error_accum = [0] * 6
 
-    def calculate_recommendation(self, target, measured, base_speed):
+    def calculate_recommendation(self, target, measured, base_speed_mps):
         error = measured - target
 
         self.error_accum.append(error)
         if len(self.error_accum) > 10:
             self.error_accum.pop(0)
 
-        prev_error = self.error_accum[-2] if len(self.error_accum) >= 2 else 0
+        prev_error = self.error_accum[-2] if len(self.error_accum) >= 2 else 0.0
 
         p_term = self.kp * error
         i_term = self.ki * np.sum(self.error_accum)
         d_term = self.kd * (error - prev_error)
 
         control_signal = p_term + i_term + d_term
-        new_speed = base_speed + control_signal
+        new_speed = base_speed_mps + control_signal
 
         final_speed = max(Config.MIN_SPEED, min(Config.MAX_SPEED, new_speed))
 
@@ -285,12 +293,9 @@ class VisionSystem:
         distancia = 0.0
 
         if len(contours) > 0:
-            sorted_contours = sorted(contours, key=cv.contourArea, reverse=True)
-            largest = sorted_contours[0]
-
+            largest = sorted(contours, key=cv.contourArea, reverse=True)[0]
             cv.drawContours(img_hud, largest, -1, (0, 255, 0), 3)
 
-            # Medición
             radius_h = 4500
             radius_l = 4000
 
@@ -304,13 +309,10 @@ class VisionSystem:
             if len(bordes_circulo) > 1:
                 p1 = bordes_circulo[0]
                 p2 = bordes_circulo[-1]
-
                 cv.line(img_hud, tuple(p1), tuple(p2), (0, 255, 255), 4)
-
                 distancia_pix = np.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
                 distancia = np.round(distancia_pix * Config.FACTOR_DISTANCIA, 1)
 
-        # HUD panel
         cv.rectangle(img_hud, (0, 0), (Config.HUD_PANEL_WIDTH, Config.HUD_PANEL_HEIGHT), (0, 0, 0), -1)
 
         if abs(error) < 1.0:
@@ -352,7 +354,7 @@ class ToFSensor:
             self.tof = VL53L1X.VL53L1X(i2c_bus=Config.TOF_I2C_BUS, i2c_address=Config.TOF_I2C_ADDRESS)
             self.tof.open()
             try:
-                self.tof.set_timing_budget(Config.TOF_TIMING_BUDGET_MS * 1000)  # a veces es us
+                self.tof.set_timing_budget(Config.TOF_TIMING_BUDGET_MS * 1000)
             except Exception:
                 pass
             try:
@@ -369,7 +371,7 @@ class ToFSensor:
         if not self.enabled or self.tof is None:
             return None
         try:
-            d = self.tof.get_distance()  # mm
+            d = self.tof.get_distance()
             if d is None or d <= 0:
                 return None
             self.buf.append(float(d))
@@ -390,17 +392,14 @@ class ToFSensor:
 
 
 def height_recommendation(ed_mm, base_speed_mps):
-    """
-    Recomendación simple por altura/distancia:
-    - ed_mm > 0: estás más lejos que la meta (ToF mide mayor distancia)
-    - ed_mm < 0: estás más cerca que la meta
-    """
+    delta_mps = mm_min_to_mps(Config.HEIGHT_DELTA_MM_MIN)
+
     if abs(ed_mm) < 2.0:
         return base_speed_mps, "ALTURA OK"
     elif ed_mm > 2.0:
-        return max(Config.MIN_SPEED, base_speed_mps - 0.005), "ALTURA: BAJAR VEL"
+        return max(Config.MIN_SPEED, base_speed_mps - delta_mps), "ALTURA: BAJAR VEL"
     else:
-        return min(Config.MAX_SPEED, base_speed_mps + 0.005), "ALTURA: SUBIR VEL"
+        return min(Config.MAX_SPEED, base_speed_mps + delta_mps), "ALTURA: SUBIR VEL"
 
 
 # ==============================================================================
@@ -413,20 +412,19 @@ def main():
     print(" (Lazo Abierto - Solo Medición y Visualización)")
     print("=" * 70)
 
-    # ----------------------------------------------------
-    # 1. INITIAL SETUP
-    # ----------------------------------------------------
+    # 1) Inputs
     try:
         raw_setpoint = input("Coloque el ancho objetivo del filamento [mm]:\n")
         set_point = float(raw_setpoint) if raw_setpoint else 30.0
         print()
         print("Velocidad base de referencia (para cálculo teórico de recomendaciones)")
-        raw_vel = input("Velocidad base [mm/s]:\n")
-        velocidad_base = float(raw_vel) / 1000 if raw_vel else 0.02  # a m/s
+        raw_vel = input("Velocidad base [mm/min]:\n")
+        vel_base_mm_min = float(raw_vel) if raw_vel else 1200.0
+        velocidad_base = mm_min_to_mps(vel_base_mm_min)
     except ValueError:
         print("Entrada inválida. Usando valores por defecto.")
         set_point = 30.0
-        velocidad_base = 0.02
+        velocidad_base = mm_min_to_mps(1200.0)
 
     logger = DataLogger()
     recommendation_sim = RecommendationSimulator(Config.DEFAULT_KP, Config.DEFAULT_KI, Config.DEFAULT_KD)
@@ -436,9 +434,7 @@ def main():
     tof_ok = tof.start()
     print(f"ToF sensor: {'OK' if tof_ok else 'OFF'}")
 
-    # ----------------------------------------------------
-    # 2. CAMERA CONNECTION
-    # ----------------------------------------------------
+    # 2) Cameras
     print("\nConectando con cámaras Orbbec...")
     try:
         ctx = Context()
@@ -460,7 +456,6 @@ def main():
         pipeline0 = Pipeline(device0)
         pipeline1 = Pipeline(device1)
 
-        # Depth
         profile_list0 = pipeline0.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
         depth_profile0 = profile_list0.get_default_video_stream_profile()
         config0.enable_stream(depth_profile0)
@@ -469,9 +464,6 @@ def main():
         depth_profile1 = profile_list1.get_default_video_stream_profile()
         config1.enable_stream(depth_profile1)
 
-        print("Depth profiles configured.")
-
-        # Color
         profile_list0 = pipeline0.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
         profile_list1 = pipeline1.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
 
@@ -494,14 +486,12 @@ def main():
         print(f"Critical Camera Error: {e}")
         return
 
-    # Windows (crear una vez, no en cada loop)
+    # Windows
     cv.namedWindow("Visualizacion completa", cv.WINDOW_NORMAL)
     cv.setWindowProperty("Visualizacion completa", cv.WND_PROP_FULLSCREEN, cv.WINDOW_FULLSCREEN)
     cv.namedWindow("Filtro", cv.WINDOW_NORMAL)
 
-    # ----------------------------------------------------
-    # 3. MONITORING LOOP
-    # ----------------------------------------------------
+    # 3) Loop
     time.sleep(1)
     last_print_time = time.time()
 
@@ -512,7 +502,6 @@ def main():
 
     try:
         while True:
-            # A. ACQUIRE FRAMES
             frames0 = pipeline0.wait_for_frames(200)
             frames1 = pipeline1.wait_for_frames(200)
             if frames0 is None or frames1 is None:
@@ -526,36 +515,29 @@ def main():
             if not depth_frame0 or not depth_frame1 or not color_frame0 or not color_frame1:
                 continue
 
-            # B. CONVERT TO IMAGES
             color_image0 = frame_to_bgr_image(color_frame0)
             color_image1 = frame_to_bgr_image(color_frame1)
             if color_image0 is None or color_image1 is None:
-                print("Failed to convert frame to image")
                 continue
 
-            # C. FIRST PASS (solo para medir ancho)
             measured_width, img_fil, img_hud, img_ori2 = vision.process_images(
                 color_image0, color_image1, set_point, 0.0, ""
             )
 
-            # D. PID SIM (recomendación por ancho)
             velocity_recommended, error_w, action_w, p_term, i_term, d_term = \
                 recommendation_sim.calculate_recommendation(set_point, measured_width, velocidad_base)
 
-            # E. ToF
             tof_mm = tof.read_mm()
             if tof_mm is None:
                 tof_mm = float("nan")
 
-            ed = (tof_mm - Config.TARGET_DISTANCE_MM) if (tof_mm == tof_mm) else 0.0  # NaN check
+            ed = (tof_mm - Config.TARGET_DISTANCE_MM) if (tof_mm == tof_mm) else 0.0
             vel_h, action_h = height_recommendation(ed, velocity_recommended)
 
-            # F. SECOND PASS (HUD con recomendación de ancho)
             measured_width, img_fil, img_hud, img_ori2 = vision.process_images(
                 color_image0, color_image1, set_point, error_w, action_w
             )
 
-            # G. Dibujar ToF en HUD (sin tocar process_images)
             cv.putText(
                 img_hud,
                 f"ToF: {tof_mm:.1f} mm  ed: {ed:.1f}  {action_h}",
@@ -566,19 +548,17 @@ def main():
                 2
             )
 
-            # Print periodic status
             current_time = time.time()
             if current_time - last_print_time >= Config.PRINT_INTERVAL:
-                print(f"Ancho: {measured_width:.1f} mm | ew: {error_w:+.2f} mm | {action_w} | "
-                      f"Vel(w): {velocity_recommended*1000:.2f} mm/s")
-                print(f"ToF: {tof_mm:.1f} mm | ed: {ed:+.1f} mm | {action_h} | Vel(h): {vel_h*1000:.2f} mm/s")
+                vel_w_mm_min = mps_to_mm_min(velocity_recommended)
+                vel_h_mm_min = mps_to_mm_min(vel_h)
+                print(f"Ancho: {measured_width:.1f} mm | ew: {error_w:+.2f} mm | {action_w} | Vel(w): {vel_w_mm_min:.1f} mm/min")
+                print(f"ToF: {tof_mm:.1f} mm | ed: {ed:+.1f} mm | {action_h} | Vel(h): {vel_h_mm_min:.1f} mm/min")
                 last_print_time = current_time
 
-            # H. LOGGING
             logger.log(measured_width, set_point, error_w, velocity_recommended, action_w,
                        p_term, i_term, d_term, tof_mm, ed, action_h)
 
-            # I. VISUALIZATION
             final_view = np.concatenate((img_fil, img_hud), axis=1)
             cv.imshow("Visualizacion completa", final_view)
             cv.imshow("Filtro", img_ori2)
